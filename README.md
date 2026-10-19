@@ -5,6 +5,7 @@ Stream Shelf is an Android TV IPTV catalog browser and player for services that 
 ## Current features
 
 - Android TV launcher entry point and D-pad-focused Compose interface.
+- Poster artwork from provider stream icons and TMDB matches.
 - Xtream API import for live channels, movies, series, and series episodes.
 - Media3 playback for live channels, movies, and episodes.
 - Provider categories shown as separate shelves.
@@ -12,7 +13,7 @@ Stream Shelf is an Android TV IPTV catalog browser and player for services that 
 - Optional TMDB title matching for up to the first 15 movies and 15 series, with year, language, and genre shelves. TMDB is not required to connect or play.
 - Demo mode for browsing the interface without a provider.
 
-This is an early MVP. It does not yet provide artwork browsing, user-defined streaming-service labels, TMDB collections or provider-service grouping, episode resume, EPG, parental controls, offline downloads, or manual TMDB match correction. Matching covers only the first 15 movies and 15 series in the provider response, and uncertain title matches are skipped. Provider category names are the initial shelf grouping; TMDB genre, year, and language shelves appear after matching.
+This is an early MVP. It does not yet provide user-defined streaming-service labels, TMDB collections or streaming-provider shelves, episode resume, EPG, parental controls, offline downloads, or manual TMDB match correction. Matching covers up to the first 15 movies and 15 series in the provider response, and uncertain title matches are skipped. Provider category names are the initial shelf grouping; TMDB genre, year, and language shelves appear after the user runs matching.
 
 ## Build
 
@@ -28,7 +29,7 @@ The debug APK is written to `app/build/outputs/apk/debug/app-debug.apk`. GitHub 
 
 Install the APK on an Android TV, open **Stream Shelf**, and enter the provider's base URL, username, and password on the TV. The app contacts the provider's `player_api.php` endpoint. Prefer HTTPS; some IPTV providers offer only HTTP, which exposes account and stream requests to the network between the TV and provider. Secrets are not hard-coded or sent to this repository.
 
-TMDB matching is optional and currently a helper for future catalog enrichment. If you use TMDB data, provide your own API key and follow TMDB's [API terms and attribution requirements](https://developer.themoviedb.org/docs/faq). This product is not endorsed or certified by TMDB.
+TMDB matching is optional. To use it, add your own TMDB API key while connecting the provider, then choose **MATCH TMDB** from the library. If you use TMDB data, follow its [API terms and attribution requirements](https://developer.themoviedb.org/docs/faq). This product is not endorsed or certified by TMDB.
 
 ## Privacy
 
