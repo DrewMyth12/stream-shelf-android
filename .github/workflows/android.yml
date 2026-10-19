@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -31,3 +31,18 @@ jobs:
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 30
+      - name: Publish v0.1.0 GitHub release
+        if: github.event_name == 'push' && contains(github.event.head_commit.message, '[release]')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.1.0
+          name: Stream Shelf v0.1.0
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          body: |
+            First public Android TV build of Stream Shelf.
+
+            Includes Xtream Codes playlist import, live TV, movies and series shelves, search, and optional TMDB matching. Enter provider credentials on the device; none are embedded in this release.
+          files: app/build/outputs/apk/debug/app-debug.apk
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
