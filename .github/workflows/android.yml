@@ -27,9 +27,13 @@ jobs:
         run: ./gradlew --no-daemon assembleDebug
       - name: Create Android TV emulator
         run: |
-          echo "no" | avdmanager create avd --name StreamShelfTV --package 'system-images;android-36;android-tv;x86_64' --device tv_1080p
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
+          mkdir -p "$ANDROID_AVD_HOME"
+          echo "ANDROID_AVD_HOME=$ANDROID_AVD_HOME" >> "$GITHUB_ENV"
+          echo "no" | avdmanager create avd --name StreamShelfTV --package 'system-images;android-36;android-tv;x86_64' --device tv_1080p --path "$ANDROID_AVD_HOME/StreamShelfTV.avd"
       - name: Install and smoke-test APK in Android TV emulator
         run: |
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
           "$ANDROID_HOME/emulator/emulator" -avd StreamShelfTV -no-window -gpu swiftshader_indirect -no-snapshot -no-audio -no-boot-anim -no-metrics -accel on > emulator.log 2>&1 &
           if ! timeout 180s adb wait-for-device; then
             cat emulator.log
