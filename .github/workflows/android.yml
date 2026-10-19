@@ -21,10 +21,43 @@ jobs:
           java-version: '17'
       - uses: android-actions/setup-android@v3
         with:
-          packages: 'platform-tools platforms;android-36 build-tools;35.0.0'
+          packages: 'platform-tools platforms;android-36 build-tools;35.0.0 emulator system-images;android-36;android-tv;x86_64'
       - uses: gradle/actions/setup-gradle@v4
       - name: Build debug APK
         run: ./gradlew --no-daemon assembleDebug
+      - name: Create Android TV emulator
+        run: |
+          echo "no" | avdmanager create avd --name StreamShelfTV --package 'system-images;android-36;android-tv;x86_64' --device tv_1080p
+      - name: Install and smoke-test APK in Android TV emulator
+        run: |
+          emulator -avd StreamShelfTV -no-window -gpu swiftshader_indirect -no-snapshot -no-audio -no-boot-anim -accel on > emulator.log 2>&1 &
+          adb wait-for-device
+          for attempt in $(seq 1 90); do
+            if [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" = "1" ]; then
+              break
+            fi
+            sleep 2
+          done
+          if [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" != "1" ]; then
+            cat emulator.log
+            echo "Android TV emulator did not finish booting"
+            exit 1
+          fi
+          adb install -r app/build/outputs/apk/debug/app-debug.apk
+          adb shell am start -W -n tv.streamshelf.app/.MainActivity
+          sleep 10
+          if ! adb shell pidof tv.streamshelf.app; then
+            adb logcat -d -b crash
+            echo "Stream Shelf process exited after launch"
+            exit 1
+          fi
+          adb exec-out screencap -p > stream-shelf-emulator.png
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stream-shelf-emulator-screenshot
+          path: stream-shelf-emulator.png
+          if-no-files-found: error
+          retention-days: 7
       - uses: actions/upload-artifact@v4
         with:
           name: stream-shelf-debug-apk
@@ -42,7 +75,7 @@ jobs:
           body: |
             First public Android TV build of Stream Shelf.
 
-            Includes Xtream Codes playlist import, live TV, movies and series shelves, search, and optional TMDB matching. Enter provider credentials on the device; none are embedded in this release.
+            Includes Xtream Codes playlist import, live TV, movies and series shelves, search, and optional TMDB matching. Enter provider credentials on the device; none are embedded in the release.
           files: app/build/outputs/apk/debug/app-debug.apk
         env:
           GITHUB_TOKEN: ${{ github.token }}
