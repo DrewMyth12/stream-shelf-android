@@ -30,8 +30,12 @@ jobs:
           echo "no" | avdmanager create avd --name StreamShelfTV --package 'system-images;android-36;android-tv;x86_64' --device tv_1080p
       - name: Install and smoke-test APK in Android TV emulator
         run: |
-          emulator -avd StreamShelfTV -no-window -gpu swiftshader_indirect -no-snapshot -no-audio -no-boot-anim -accel on > emulator.log 2>&1 &
-          adb wait-for-device
+          "$ANDROID_HOME/emulator/emulator" -avd StreamShelfTV -no-window -gpu swiftshader_indirect -no-snapshot -no-audio -no-boot-anim -no-metrics -accel on > emulator.log 2>&1 &
+          if ! timeout 180s adb wait-for-device; then
+            cat emulator.log
+            echo "Android TV emulator did not become available to ADB"
+            exit 1
+          fi
           for attempt in $(seq 1 90); do
             if [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" = "1" ]; then
               break
