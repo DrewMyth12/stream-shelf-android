@@ -1,12 +1,13 @@
 package tv.streamshelf.app
 
-import android.os.Bundle
+import android.content.Context
 import android.content.Intent
+import android.net.Uri
+import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
-import androidx.compose.foundation.focusable
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -22,6 +23,7 @@ import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -33,30 +35,69 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Card
 import androidx.tv.material3.CardDefaults
+import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.MaterialTheme
 import androidx.tv.material3.Text
 import coil3.compose.AsyncImage
-import androidx.compose.foundation.text.BasicTextField
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.input.VisualTransformation
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 private val Ink = Color(0xFF080B12)
-private val Mint = Color(0xFF72E6C1)
-private val Muted = Color(0xFF9AA5B5)
+private val Panel = Color(0xFF151F2E)
+private val PanelRaised = Color(0xFF202D40)
+private val Mint = Color(0xFF74E5C1)
+private val Muted = Color(0xFFA2ADBC)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent { StreamShelfApp() }
+    }
+}
+
+private enum class ShelfTab(val label: String) {
+    LIVE("LIVE TV"), MOVIES("MOVIES"), SERIES("SERIES")
+}
+
+private enum class SortOrder(val label: String) {
+    TITLE("A–Z"), YEAR_NEWEST("YEAR ↓"), YEAR_OLDEST("YEAR ↑");
+    fun next() = entries[(ordinal + 1) % entries.size]
+}
+
+private data class ShelfOptions(
+    val providerCategories: Boolean = true,
+    val streamingServices: Boolean = true,
+    val years: Boolean = true,
+    val languages: Boolean = true,
+    val genres: Boolean = true,
+    val collections: Boolean = true,
+    val sortOrder: SortOrder = SortOrder.TITLE,
+)
+
+private class ShelfOptionsStore(context: Context) {
+    private val prefs = context.getSharedPreferences("shelf_options", Context.MODE_PRIVATE)
+    fun load() = ShelfOptions(
+        providerCategories = prefs.getBoolean("categories", true),
+        streamingServices = prefs.getBoolean("services", true),
+        years = prefs.getBoolean("years", true),
+        languages = prefs.getBoolean("languages", true),
+        genres = prefs.getBoolean("genres", true),
+        collections = prefs.getBoolean("collections", true),
+        sortOrder = runCatching { SortOrder.valueOf(prefs.getString("sort", SortOrder.TITLE.name)!!) }.getOrDefault(SortOrder.TITLE),
+    )
+    fun save(value: ShelfOptions) {
+        prefs.edit().putBoolean("categories", value.providerCategories).putBoolean("services", value.streamingServices)
+            .putBoolean("years", value.years).putBoolean("languages", value.languages).putBoolean("genres", value.genres)
+            .putBoolean("collections", value.collections).putString("sort", value.sortOrder.name).apply()
     }
 }
 
@@ -66,92 +107,142 @@ private fun StreamShelfApp() {
     val activity = context as? MainActivity
     val scope = rememberCoroutineScope()
     val vault = remember { CredentialVault(context.applicationContext) }
+    val metadataCache = remember { TmdbMetadataCache(context.applicationContext) }
+    val optionsStore = remember { ShelfOptionsStore(context.applicationContext) }
     var base by remember { mutableStateOf("") }
     var username by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
     var tmdbKey by remember { mutableStateOf("") }
+    var region by remember { mutableStateOf("IN") }
+    var savedConfig by remember { mutableStateOf<ProviderConfig?>(null) }
+    var options by remember { mutableStateOf(optionsStore.load()) }
     var snapshot by remember { mutableStateOf<CatalogSnapshot?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
+    var status by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
+    var initialLoadComplete by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
+    var activeTab by remember { mutableStateOf(ShelfTab.LIVE) }
     var selectedSeries by remember { mutableStateOf<CatalogEntry?>(null) }
     var episodes by remember { mutableStateOf<List<SeriesEpisode>?>(null) }
     var query by remember { mutableStateOf("") }
 
     LaunchedEffect(Unit) {
-        vault.load()?.let {
-            base = it.baseUrl
-            username = it.username
-            password = it.password
-            tmdbKey = it.tmdbApiKey
+        vault.load()?.let { config ->
+            savedConfig = config
+            base = config.baseUrl
+            username = config.username
+            password = config.password
+            tmdbKey = config.tmdbApiKey
+            region = config.tmdbRegion
             busy = true
-            runCatching { withContext(Dispatchers.IO) { XtreamRepository(it).loadCatalog() } }
+            runCatching { withContext(Dispatchers.IO) { XtreamRepository(config).loadCatalog() } }
                 .onSuccess { snapshot = it }
-                .onFailure { error = it.message ?: "Could not load this provider catalog" }
+                .onFailure { error = it.message ?: "Could not load your provider catalog" }
             busy = false
         }
+        initialLoadComplete = true
+    }
+
+    fun updateOptions(updated: ShelfOptions) {
+        options = updated
+        optionsStore.save(updated)
     }
 
     MaterialTheme {
-        Box(modifier = Modifier.fillMaxSize().background(Ink)) {
-            if (showSettings || snapshot == null) {
-                ProviderSetup(
+        Box(Modifier.fillMaxSize().background(Ink)) {
+            if (!initialLoadComplete && savedConfig != null) {
+                LoadingScreen()
+            } else if (showSettings || snapshot == null) {
+                SettingsScreen(
+                    isFirstRun = snapshot == null,
                     base = base, onBase = { base = it }, username = username, onUsername = { username = it },
                     password = password, onPassword = { password = it }, tmdbKey = tmdbKey, onTmdbKey = { tmdbKey = it },
+                    region = region, onRegion = { region = it.uppercase().filter(Char::isLetter).take(2) },
+                    options = options, onOptions = ::updateOptions,
                     error = error, busy = busy,
                     onConnect = {
                         error = null
                         val normalized = base.trim().trimEnd('/')
-                        if (!(normalized.startsWith("https://") || normalized.startsWith("http://"))) {
-                            error = "Enter a complete provider URL beginning with https:// or http://"
-                        } else if (username.isBlank() || password.isBlank()) {
-                            error = "Enter the provider username and password"
-                        } else {
+                        val normalizedRegion = region.trim().uppercase().takeIf { it.matches(Regex("[A-Z]{2}")) } ?: "IN"
+                        if (!(normalized.startsWith("https://") || normalized.startsWith("http://"))) error = "Enter a complete provider URL beginning with https:// or http://"
+                        else if (username.isBlank() || password.isBlank()) error = "Enter the provider username and password"
+                        else {
                             busy = true
                             scope.launch {
                                 runCatching {
-                                    val cfg = ProviderConfig(normalized, username.trim(), password, tmdbKey.trim())
-                                    withContext(Dispatchers.IO) { XtreamRepository(cfg).loadCatalog() }.also { vault.save(cfg) }
-                                }.onSuccess { snapshot = it; showSettings = false }
+                                    val config = ProviderConfig(normalized, username.trim(), password, tmdbKey.trim(), normalizedRegion)
+                                    withContext(Dispatchers.IO) { XtreamRepository(config).loadCatalog() }.also { vault.save(config); savedConfig = config }
+                                }.onSuccess { snapshot = it; showSettings = false; selectedSeries = null }
                                     .onFailure { error = it.message ?: "Provider connection failed" }
                                 busy = false
                             }
                         }
                     },
-                    onContinueWithoutAccount = {
-                        snapshot = demoCatalog()
-                        showSettings = false
+                    onSave = {
+                        val prior = savedConfig
+                        if (prior != null) {
+                            val normalized = base.trim().trimEnd('/')
+                            val normalizedRegion = region.trim().uppercase().takeIf { it.matches(Regex("[A-Z]{2}")) } ?: "IN"
+                            if (!(normalized.startsWith("https://") || normalized.startsWith("http://"))) error = "Enter a complete provider URL beginning with https:// or http://"
+                            else if (username.isBlank() || password.isBlank()) error = "Enter the provider username and password"
+                            else {
+                                val config = ProviderConfig(normalized, username.trim(), password, tmdbKey.trim(), normalizedRegion)
+                                val providerChanged = config.baseUrl != prior.baseUrl || config.username != prior.username || config.password != prior.password
+                                if (providerChanged) {
+                                    busy = true
+                                    scope.launch {
+                                        runCatching { withContext(Dispatchers.IO) { XtreamRepository(config).loadCatalog() } }
+                                            .onSuccess { snapshot = it; vault.save(config); savedConfig = config; status = "Provider and settings updated."; showSettings = false }
+                                            .onFailure { error = it.message ?: "Could not reconnect to the updated provider" }
+                                        busy = false
+                                    }
+                                } else {
+                                    vault.save(config)
+                                    savedConfig = config
+                                    status = "Settings saved. Choose MATCH TITLES to refresh TMDB groups."
+                                    showSettings = false
+                                }
+                            }
+                        }
                     },
+                    onDemo = { snapshot = demoCatalog(); showSettings = false },
                     onCancel = if (snapshot != null) ({ showSettings = false }) else null,
                 )
             } else {
                 LibraryScreen(
                     data = snapshot!!,
-                    query = query,
-                    onQuery = { query = it },
-                    onSettings = { showSettings = true },
-                    selectedSeries = selectedSeries,
-                    episodes = episodes,
-                    loadingEpisodes = busy,
-                    onBackFromSeries = { selectedSeries = null; episodes = null },
+                    activeTab = activeTab,
+                    onTab = { activeTab = it; selectedSeries = null; episodes = null },
+                    query = query, onQuery = { query = it },
+                    options = options, onSort = { updateOptions(options.copy(sortOrder = options.sortOrder.next())) },
+                    busy = busy, status = status, error = error,
+                    onSettings = { showSettings = true; error = null },
                     onEnrich = {
-                        val config = vault.load()
-                        if (config?.tmdbApiKey.isNullOrBlank()) error = "Add your TMDB API key in Settings before matching titles"
+                        val current = savedConfig ?: vault.load()
+                        if (current?.tmdbApiKey.isNullOrBlank()) error = "Add a TMDB API key in Settings before matching titles"
                         else if (!busy) {
                             busy = true
                             error = null
+                            status = "Matching up to 60 movies and 60 series. This can take a few minutes the first time."
                             scope.launch {
-                                runCatching { withContext(Dispatchers.IO) { TmdbRepository(config!!.tmdbApiKey).enrich(snapshot!!) } }
-                                    .onSuccess { snapshot = it }
-                                    .onFailure { error = it.message ?: "TMDB matching failed" }
+                                runCatching {
+                                    withContext(Dispatchers.IO) { TmdbRepository(current!!.tmdbApiKey, current.tmdbRegion, metadataCache).enrich(snapshot!!) }
+                                }.onSuccess {
+                                    val matched = it.movies.count { row -> row.tmdbId != null } + it.series.count { row -> row.tmdbId != null }
+                                    snapshot = it
+                                    status = "TMDB matching complete: $matched movie and series titles matched. Streaming availability by JustWatch."
+                                }.onFailure { error = it.message ?: "TMDB matching failed"; status = null }
                                 busy = false
                             }
                         }
                     },
+                    onBackFromSeries = { selectedSeries = null; episodes = null },
+                    selectedSeries = selectedSeries, episodes = episodes,
                     onOpenSeries = { entry ->
                         selectedSeries = entry
                         episodes = emptyList()
-                        val config = vault.load()
+                        val config = savedConfig
                         if (config == null) error = "Reconnect your provider to load series episodes"
                         else {
                             busy = true
@@ -165,70 +256,127 @@ private fun StreamShelfApp() {
                     },
                     onPlay = { entry ->
                         val url = entry.streamUrl
-                        if (url.isNullOrBlank()) error = "Series episode playback is being added next"
+                        if (url.isNullOrBlank()) error = "No playable stream URL is available for this item"
                         else activity?.startActivity(Intent(context, PlayerActivity::class.java).putExtra("stream_url", url).putExtra("title", entry.title))
                     },
-                    error = error
+                    onAvailability = { entry ->
+                        val url = entry.availabilityUrl ?: entry.tmdbId?.let {
+                            "https://www.themoviedb.org/${if (entry.kind == CatalogKind.MOVIE) "movie" else "tv"}/$it/watch?locale=${region.lowercase()}"
+                        } ?: "https://www.themoviedb.org/"
+                        runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
+                    },
                 )
             }
         }
     }
 }
 
+@Composable
+private fun LoadingScreen() {
+    Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFF141D2B), Ink))), contentAlignment = Alignment.Center) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("STREAM  SHELF", color = Mint, fontSize = 16.sp, fontWeight = FontWeight.Black, letterSpacing = 2.sp)
+            Text("Loading your library…", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
+            Text("This can take a moment while the TV reconnects to your provider.", color = Muted, fontSize = 12.sp)
+        }
+    }
+}
+
 private fun demoCatalog() = CatalogSnapshot(
-    live = listOf(CatalogEntry("demo-live", "Demo News", "demo-live", "News", CatalogKind.LIVE, streamUrl = null)),
-    movies = listOf(CatalogEntry("demo-movie", "Demo Movie", "demo-movies", "Movies", CatalogKind.MOVIE)),
-    series = listOf(CatalogEntry("demo-series", "Demo Series", "demo-series", "Series", CatalogKind.SERIES))
+    live = listOf(CatalogEntry("demo-live", "World News", "news", "News", CatalogKind.LIVE)),
+    movies = listOf(CatalogEntry("demo-movie", "Demo Feature", "movies", "Movies", CatalogKind.MOVIE, year = 2024)),
+    series = listOf(CatalogEntry("demo-series", "Demo Series", "series", "Series", CatalogKind.SERIES, year = 2023)),
 )
 
 @Composable
-private fun ProviderSetup(
-    base: String, onBase: (String) -> Unit, username: String, onUsername: (String) -> Unit,
-    password: String, onPassword: (String) -> Unit, tmdbKey: String, onTmdbKey: (String) -> Unit,
-    error: String?, busy: Boolean, onConnect: () -> Unit, onContinueWithoutAccount: () -> Unit,
-    onCancel: (() -> Unit)?,
+private fun SettingsScreen(
+    isFirstRun: Boolean,
+    base: String, onBase: (String) -> Unit,
+    username: String, onUsername: (String) -> Unit,
+    password: String, onPassword: (String) -> Unit,
+    tmdbKey: String, onTmdbKey: (String) -> Unit,
+    region: String, onRegion: (String) -> Unit,
+    options: ShelfOptions, onOptions: (ShelfOptions) -> Unit,
+    error: String?, busy: Boolean,
+    onConnect: () -> Unit, onSave: () -> Unit, onDemo: () -> Unit, onCancel: (() -> Unit)?,
 ) {
-    Column(Modifier.fillMaxSize().padding(horizontal = 64.dp, vertical = 42.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-        Text("STREAM SHELF", color = Mint, fontSize = 15.sp, fontWeight = FontWeight.Black, letterSpacing = 2.sp)
-        Text("Connect your library", color = Color.White, fontSize = 28.sp, fontWeight = FontWeight.Bold)
-        Text("Enter Xtream Codes details from your provider. Secrets are encrypted on this device; they are not included in the app build.", color = Muted, fontSize = 14.sp)
-        Entry("Provider URL", base, onBase)
-        Entry("Username", username, onUsername)
-        Entry("Password", password, onPassword, secret = true)
-        Entry("TMDB API key (optional for this build)", tmdbKey, onTmdbKey, secret = true)
+    LazyColumn(
+        Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFF141D2B), Ink))).padding(horizontal = 64.dp, vertical = 28.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        item { Text("STREAM  SHELF", color = Mint, fontSize = 15.sp, fontWeight = FontWeight.Black, letterSpacing = 2.sp) }
+        item { Text(if (isFirstRun) "Connect your library" else "Your library settings", color = Color.White, fontSize = 28.sp, fontWeight = FontWeight.Bold) }
+        item { Text("A remote-friendly library for Live TV, Movies, and Series. Your provider login stays encrypted on this TV.", color = Muted, fontSize = 13.sp) }
+        item { SettingsEntry("Provider URL", base, onBase) }
         if (base.trimStart().startsWith("http://", ignoreCase = true)) {
-            Text("This provider uses HTTP, which does not encrypt account details while in transit. Prefer HTTPS if your provider supports it.", color = Color(0xFFFFC078), fontSize = 12.sp)
+            item { Text("This provider uses HTTP. Account and playback requests are not encrypted while in transit; use HTTPS if your provider supports it.", color = Color(0xFFFFC078), fontSize = 11.sp) }
         }
-        Row(horizontalArrangement = Arrangement.spacedBy(14.dp), verticalAlignment = Alignment.CenterVertically) {
-            ActionCard(if (busy) "CONNECTING…" else "CONNECT") { if (!busy) onConnect() }
-            ActionCard("BROWSE DEMO") { if (!busy) onContinueWithoutAccount() }
-            onCancel?.let { ActionCard("CANCEL", it) }
+        item { SettingsEntry("Username", username, onUsername) }
+        item { SettingsEntry("Password", password, onPassword, secret = true) }
+        item { Text("METADATA & STREAMING GROUPS", color = Mint, fontSize = 12.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp) }
+        item { SettingsEntry("TMDB API key (optional)", tmdbKey, onTmdbKey, secret = true) }
+        item { SettingsEntry("Availability region (2-letter code)", region, onRegion, maxLength = 2) }
+        item { Text("TMDB matches title, poster, year, language, genre and collection. Streaming services are based on regional JustWatch availability. Matching checks the first 60 movies and 60 series each run; results are cached on this TV.", color = Muted, fontSize = 11.sp) }
+        item { Text("CUSTOM HOME SHELVES", color = Mint, fontSize = 12.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp, modifier = Modifier.padding(top = 8.dp)) }
+        item { SettingToggle("Provider categories", options.providerCategories) { onOptions(options.copy(providerCategories = !options.providerCategories)) } }
+        item { SettingToggle("Streaming services (Netflix, Prime Video, and more)", options.streamingServices) { onOptions(options.copy(streamingServices = !options.streamingServices)) } }
+        item { SettingToggle("Years", options.years) { onOptions(options.copy(years = !options.years)) } }
+        item { SettingToggle("Languages", options.languages) { onOptions(options.copy(languages = !options.languages)) } }
+        item { SettingToggle("Genres", options.genres) { onOptions(options.copy(genres = !options.genres)) } }
+        item { SettingToggle("Collections", options.collections) { onOptions(options.copy(collections = !options.collections)) } }
+        item { Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text("SORT TITLES", color = Muted, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+            ActionCard(options.sortOrder.label) { onOptions(options.copy(sortOrder = options.sortOrder.next())) }
+        } }
+        item {
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 6.dp)) {
+                ActionCard(if (busy) "CONNECTING…" else if (isFirstRun) "CONNECT" else "SAVE & RETURN", enabled = !busy, onClick = if (isFirstRun) onConnect else onSave)
+                if (isFirstRun) ActionCard("BROWSE DEMO", onClick = onDemo)
+                onCancel?.let { ActionCard("CANCEL", onClick = it) }
+            }
         }
-        error?.let { Text(it, color = Color(0xFFFF8484), fontSize = 13.sp) }
-        Text("TMDB catalog data requires your own API key and attribution. The key is optional until metadata matching is enabled.", color = Muted, fontSize = 11.sp)
+        error?.let { message -> item { Text(message, color = Color(0xFFFF8585), fontSize = 13.sp) } }
+        item { Text("TMDB metadata © TMDB. Streaming availability data provided by JustWatch. This app is not endorsed or certified by TMDB.", color = Muted, fontSize = 10.sp, modifier = Modifier.padding(top = 8.dp)) }
     }
 }
 
 @Composable
-private fun Entry(label: String, value: String, onValue: (String) -> Unit, secret: Boolean = false) {
+private fun SettingsEntry(label: String, value: String, onValue: (String) -> Unit, secret: Boolean = false, maxLength: Int = Int.MAX_VALUE) {
     Row(
-        modifier = Modifier.fillMaxWidth(0.72f).height(48.dp).background(Color(0xFF182231), RoundedCornerShape(10.dp)).padding(horizontal = 16.dp),
-        verticalAlignment = Alignment.CenterVertically
+        Modifier.fillMaxWidth(0.72f).height(44.dp).background(PanelRaised, RoundedCornerShape(10.dp)).padding(horizontal = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(label, color = Muted, fontSize = 12.sp, modifier = Modifier.width(220.dp))
-        BasicTextField(value, onValue, singleLine = true, visualTransformation = if (secret) PasswordVisualTransformation() else VisualTransformation.None,
-            textStyle = androidx.compose.ui.text.TextStyle(color = Color.White, fontSize = 14.sp), modifier = Modifier.fillMaxWidth())
+        Text(label, color = Muted, fontSize = 11.sp, modifier = Modifier.width(240.dp))
+        BasicTextField(
+            value = value,
+            onValueChange = { onValue(it.take(maxLength)) },
+            singleLine = true,
+            visualTransformation = if (secret) PasswordVisualTransformation() else VisualTransformation.None,
+            textStyle = androidx.compose.ui.text.TextStyle(color = Color.White, fontSize = 13.sp),
+            modifier = Modifier.fillMaxWidth(),
+        )
+    }
+}
+
+@Composable
+private fun SettingToggle(label: String, enabled: Boolean, onClick: () -> Unit) {
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        Text(label, color = Color.White, fontSize = 13.sp, modifier = Modifier.width(350.dp))
+        ActionCard(if (enabled) "ON" else "OFF", onClick = onClick, width = 90.dp)
     }
 }
 
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
-private fun ActionCard(label: String, onClick: () -> Unit) {
-    Card(onClick = onClick, modifier = Modifier.width(190.dp).height(48.dp),
-        shape = CardDefaults.shape(RoundedCornerShape(12.dp)),
-        colors = CardDefaults.colors(containerColor = Color(0xFF263447), focusedContainerColor = Mint)) {
-        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Text(label, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+private fun ActionCard(label: String, width: androidx.compose.ui.unit.Dp = 150.dp, enabled: Boolean = true, onClick: () -> Unit) {
+    Card(
+        onClick = { if (enabled) onClick() },
+        modifier = Modifier.width(width).height(42.dp),
+        shape = CardDefaults.shape(RoundedCornerShape(11.dp)),
+        colors = CardDefaults.colors(containerColor = PanelRaised, focusedContainerColor = Mint),
+    ) {
+        Box(Modifier.fillMaxSize().padding(horizontal = 10.dp), contentAlignment = Alignment.Center) {
+            Text(label, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold, maxLines = 1)
         }
     }
 }
@@ -236,159 +384,187 @@ private fun ActionCard(label: String, onClick: () -> Unit) {
 @Composable
 private fun LibraryScreen(
     data: CatalogSnapshot,
-    onSettings: () -> Unit,
-    query: String,
-    onQuery: (String) -> Unit,
-    selectedSeries: CatalogEntry?,
-    episodes: List<SeriesEpisode>?,
-    loadingEpisodes: Boolean,
-    onBackFromSeries: () -> Unit,
-    onEnrich: () -> Unit,
-    onOpenSeries: (CatalogEntry) -> Unit,
-    onPlay: (CatalogEntry) -> Unit,
-    error: String?,
+    activeTab: ShelfTab, onTab: (ShelfTab) -> Unit,
+    query: String, onQuery: (String) -> Unit,
+    options: ShelfOptions, onSort: () -> Unit,
+    busy: Boolean, status: String?, error: String?,
+    onSettings: () -> Unit, onEnrich: () -> Unit,
+    onBackFromSeries: () -> Unit, selectedSeries: CatalogEntry?, episodes: List<SeriesEpisode>?,
+    onOpenSeries: (CatalogEntry) -> Unit, onPlay: (CatalogEntry) -> Unit, onAvailability: (CatalogEntry) -> Unit,
 ) {
-    val dataToShow = if (query.isBlank()) data else CatalogSnapshot(
-        live = data.live.filter { it.title.contains(query, true) || it.category.contains(query, true) },
-        movies = data.movies.filter { it.title.contains(query, true) || it.category.contains(query, true) || it.tmdbGenres.any { genre -> genre.contains(query, true) } },
-        series = data.series.filter { it.title.contains(query, true) || it.category.contains(query, true) || it.tmdbGenres.any { genre -> genre.contains(query, true) } },
-    )
-    LazyColumn(modifier = Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFF111A2A), Ink))).padding(start = 52.dp, top = 28.dp, bottom = 22.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
-        item { Header(onSettings, selectedSeries != null, onBackFromSeries, onEnrich, query, onQuery) }
+    BackHandler(enabled = selectedSeries != null) { onBackFromSeries() }
+    val entries = when (activeTab) {
+        ShelfTab.LIVE -> data.live
+        ShelfTab.MOVIES -> data.movies
+        ShelfTab.SERIES -> data.series
+    }
+    val filtered = entries.filter { row ->
+        query.isBlank() || row.title.contains(query, true) || row.category.contains(query, true) ||
+            row.tmdbGenres.any { it.contains(query, true) } || row.tmdbProviders.any { it.contains(query, true) } ||
+            row.year?.toString()?.contains(query, true) == true || row.language?.contains(query, true) == true ||
+            row.collection?.contains(query, true) == true
+    }
+    val sortRows: (List<CatalogEntry>) -> List<CatalogEntry> = { rows ->
+        when (options.sortOrder) {
+            SortOrder.TITLE -> rows.sortedBy { it.title.lowercase() }
+            SortOrder.YEAR_NEWEST -> rows.sortedWith(compareByDescending<CatalogEntry> { it.year ?: 0 }.thenBy { it.title.lowercase() })
+            SortOrder.YEAR_OLDEST -> rows.sortedWith(compareBy<CatalogEntry> { it.year ?: Int.MAX_VALUE }.thenBy { it.title.lowercase() })
+        }
+    }
+
+    LazyColumn(
+        Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFF111A28), Ink))).padding(start = 46.dp, top = 22.dp, bottom = 20.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        item {
+            Row(Modifier.fillMaxWidth().padding(end = 46.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text("STREAM", color = Color.White, fontSize = 19.sp, fontWeight = FontWeight.Black, letterSpacing = 2.sp)
+                Text("SHELF", color = Mint, fontSize = 19.sp, fontWeight = FontWeight.Black, letterSpacing = 2.sp)
+                Spacer(Modifier.width(28.dp))
+                ShelfTab.entries.forEach { tab ->
+                    val count = when (tab) { ShelfTab.LIVE -> data.live.size; ShelfTab.MOVIES -> data.movies.size; ShelfTab.SERIES -> data.series.size }
+                    ActionCard("${tab.label}  $count", onClick = { onTab(tab) }, width = 154.dp)
+                    Spacer(Modifier.width(8.dp))
+                }
+                Spacer(Modifier.weight(1f))
+                ActionCard("SETTINGS", onClick = onSettings, width = 116.dp)
+            }
+        }
         if (selectedSeries != null) {
-            item { Text(selectedSeries.title, color = Color.White, fontSize = 27.sp, fontWeight = FontWeight.Bold) }
-            if (loadingEpisodes) item { Text("Loading episodes…", color = Muted) }
-            if (episodes?.isEmpty() == true && !loadingEpisodes) item { Text("No playable episodes were returned for this series.", color = Muted) }
-            val bySeason = episodes.orEmpty().groupBy { it.season }.toSortedMap()
-            bySeason.forEach { (season, rows) ->
-                item { ShelfEpisodes(if (season > 0) "Season $season" else "Episodes", rows, onPlay) }
+            item {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    ActionCard("← LIBRARY", onClick = onBackFromSeries)
+                    Text(selectedSeries.title, color = Color.White, fontSize = 25.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+            if (busy) item { Text("Loading episodes…", color = Muted, fontSize = 13.sp) }
+            if (episodes?.isEmpty() == true && !busy) item { Text("No episodes were returned for this series.", color = Muted, fontSize = 13.sp) }
+            episodes.orEmpty().groupBy { it.season }.toSortedMap().forEach { (season, rows) ->
+                item { EpisodeShelf(if (season > 0) "SEASON $season" else "EPISODES", rows, onPlay) }
             }
         } else {
-        item { Featured(onPlay, dataToShow.live.firstOrNull()) }
-        if (error != null) item { Text(error, color = Color(0xFFFF8484), fontSize = 13.sp) }
-        groupedShelves("Live TV", dataToShow.live, onPlay)
-        groupedShelves("Movies", dataToShow.movies, onPlay)
-        if (dataToShow.movies.any { it.tmdbGenres.isNotEmpty() }) {
-            dataToShow.movies.filter { it.tmdbGenres.isNotEmpty() }.groupBy { it.year?.toString() ?: "Year unknown" }
-                .toSortedMap(compareByDescending { it.toIntOrNull() ?: 0 }).forEach { (year, entries) ->
-                    item { ShelfEntries("Movies • $year", entries, onPlay) }
-                }
-            dataToShow.movies.filter { it.tmdbGenres.isNotEmpty() }.groupBy { it.language ?: "Language unknown" }
-                .toSortedMap().forEach { (language, entries) ->
-                    item { ShelfEntries("Movies • $language", entries, onPlay) }
-                }
-            dataToShow.movies.filter { it.tmdbGenres.isNotEmpty() }.flatMap { entry -> entry.tmdbGenres.map { it to entry } }
-                .groupBy({ it.first }, { it.second }).toSortedMap().forEach { (genre, entries) ->
-                    item { ShelfEntries("Movies • $genre", entries, onPlay) }
-                }
-        }
-        dataToShow.series.groupBy { it.category }.toSortedMap().forEach { (category, entries) ->
-            item { ShelfEntries("Series • $category • ${entries.size}", entries, onOpenSeries) }
-        }
-        if (dataToShow.series.any { it.tmdbGenres.isNotEmpty() }) {
-            dataToShow.series.filter { it.tmdbGenres.isNotEmpty() }.groupBy { it.year?.toString() ?: "Year unknown" }
-                .toSortedMap(compareByDescending { it.toIntOrNull() ?: 0 }).forEach { (year, entries) ->
-                    item { ShelfEntries("Series • $year", entries, onOpenSeries) }
-                }
-            dataToShow.series.filter { it.tmdbGenres.isNotEmpty() }.groupBy { it.language ?: "Language unknown" }
-                .toSortedMap().forEach { (language, entries) ->
-                    item { ShelfEntries("Series • $language", entries, onOpenSeries) }
-                }
-            dataToShow.series.filter { it.tmdbGenres.isNotEmpty() }.flatMap { entry -> entry.tmdbGenres.map { it to entry } }
-                .groupBy({ it.first }, { it.second }).toSortedMap().forEach { (genre, entries) ->
-                    item { ShelfEntries("Series • $genre", entries, onOpenSeries) }
-                }
-        }
-        if (dataToShow.live.isEmpty() && dataToShow.movies.isEmpty() && dataToShow.series.isEmpty()) item { Text(if (query.isNotBlank()) "No titles match your search." else "Connected, but the provider returned no catalog entries.", color = Muted) }
-        }
-    }
-}
-
-private fun LazyListScope.groupedShelves(kind: String, rows: List<CatalogEntry>, onPlay: (CatalogEntry) -> Unit) {
-    rows.groupBy { it.category }.toSortedMap().forEach { (category, entries) ->
-        item { ShelfEntries("$kind • $category • ${entries.size}", entries, onPlay) }
-    }
-}
-
-@Composable
-private fun Header(onSettings: () -> Unit, inSeries: Boolean = false, onBack: () -> Unit = {}, onEnrich: () -> Unit = {}, query: String, onQuery: (String) -> Unit) {
-    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().padding(end = 52.dp)) {
-        Text("STREAM", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Black, letterSpacing = 2.sp)
-        Text("SHELF", color = Mint, fontSize = 20.sp, fontWeight = FontWeight.Black, letterSpacing = 2.sp)
-        Spacer(Modifier.width(42.dp))
-        if (inSeries) ActionCard("←  LIBRARY", onBack)
-        else {
-            BasicTextField(query, onQuery, singleLine = true,
-                textStyle = androidx.compose.ui.text.TextStyle(color = Color.White, fontSize = 13.sp),
-                modifier = Modifier.width(180.dp).background(Color(0xFF182231), RoundedCornerShape(8.dp)).padding(horizontal = 10.dp, vertical = 8.dp),
-                decorationBox = { inner -> if (query.isBlank()) Text("Search", color = Muted, fontSize = 13.sp); inner() })
-            Spacer(Modifier.width(10.dp))
-            ActionCard("MATCH TMDB", onEnrich)
-        }
-        Spacer(Modifier.weight(1f))
-        ActionCard("SETTINGS", onClick = onSettings)
-    }
-}
-
-@OptIn(ExperimentalTvMaterial3Api::class)
-@Composable
-private fun ShelfEpisodes(title: String, entries: List<SeriesEpisode>, onPlay: (CatalogEntry) -> Unit) {
-    Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
-        Text(title, color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
-        LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            items(entries, key = { "episode:${it.id}" }) { episode ->
-                val entry = CatalogEntry(episode.id, episode.title, "${episode.season}", "S${episode.season}E${episode.episode}", CatalogKind.MOVIE, streamUrl = episode.streamUrl)
-                Card(onClick = { onPlay(entry) }, modifier = Modifier.width(230.dp).height(84.dp),
-                    shape = CardDefaults.shape(RoundedCornerShape(12.dp)),
-                    colors = CardDefaults.colors(containerColor = Color(0xFF202A39), focusedContainerColor = Mint)) {
-                    Column(Modifier.fillMaxSize().padding(horizontal = 14.dp, vertical = 10.dp), verticalArrangement = Arrangement.Center) {
-                        Text("Episode ${episode.episode}", color = Mint, fontSize = 11.sp)
-                        Text(episode.title.take(32), color = Color.White, fontSize = 14.sp, maxLines = 1)
+            item {
+                Row(Modifier.fillMaxWidth().padding(end = 46.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Box(Modifier.width(360.dp).height(40.dp).background(Panel, RoundedCornerShape(10.dp)).padding(horizontal = 13.dp), contentAlignment = Alignment.CenterStart) {
+                        if (query.isBlank()) Text("Search this library", color = Muted, fontSize = 12.sp)
+                        BasicTextField(query, onQuery, singleLine = true, textStyle = androidx.compose.ui.text.TextStyle(color = Color.White, fontSize = 12.sp), modifier = Modifier.fillMaxWidth())
                     }
+                    ActionCard("SORT  ${options.sortOrder.label}", onClick = onSort, width = 140.dp)
+                    ActionCard(if (busy) "MATCHING…" else "MATCH TITLES", onClick = onEnrich, width = 144.dp, enabled = !busy)
+                    Spacer(Modifier.weight(1f))
+                    Text(if (activeTab == ShelfTab.LIVE) "CHANNELS" else "TITLES", color = Muted, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+            item { HeroPanel(activeTab, filtered.size) }
+            error?.let { message -> item { Text(message, color = Color(0xFFFF8585), fontSize = 12.sp) } }
+            status?.let { message -> item { Text(message, color = Mint, fontSize = 11.sp) } }
+            item {
+                Text(
+                    when (activeTab) { ShelfTab.LIVE -> "LIVE TV"; ShelfTab.MOVIES -> "MOVIES"; ShelfTab.SERIES -> "SERIES" },
+                    color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.2.sp,
+                )
+            }
+            if (options.providerCategories) addGroups("PROVIDER CATEGORIES", filtered, { it.category }, sortRows, onOpenSeries, onPlay, activeTab)
+            if (activeTab != ShelfTab.LIVE && options.streamingServices) {
+                val services = filtered.flatMap { it.tmdbProviders }.distinct().sorted()
+                services.take(16).forEach { service ->
+                    val rows = filtered.filter { service in it.tmdbProviders }
+                    item { EntryShelf(service.uppercase(), sortRows(rows), activeTab, onOpenSeries, onPlay) }
+                }
+            }
+            if (activeTab != ShelfTab.LIVE && options.collections) {
+                filtered.filter { !it.collection.isNullOrBlank() }.groupBy { it.collection!! }.toSortedMap().forEach { (name, rows) ->
+                    item { EntryShelf("COLLECTION  •  ${name.uppercase()}", sortRows(rows), activeTab, onOpenSeries, onPlay) }
+                }
+            }
+            if (activeTab != ShelfTab.LIVE && options.years) {
+                filtered.filter { it.year != null }.groupBy { it.year!! }.toSortedMap(compareByDescending { it }).forEach { (year, rows) ->
+                    item { EntryShelf("YEAR  •  $year", sortRows(rows), activeTab, onOpenSeries, onPlay) }
+                }
+            }
+            if (activeTab != ShelfTab.LIVE && options.languages) {
+                filtered.filter { !it.language.isNullOrBlank() }.groupBy { it.language!!.uppercase() }.toSortedMap().forEach { (language, rows) ->
+                    item { EntryShelf("LANGUAGE  •  $language", sortRows(rows), activeTab, onOpenSeries, onPlay) }
+                }
+            }
+            if (activeTab != ShelfTab.LIVE && options.genres) {
+                filtered.flatMap { row -> row.tmdbGenres.map { it to row } }.groupBy({ it.first }, { it.second }).toSortedMap().forEach { (genre, rows) ->
+                    item { EntryShelf("GENRE  •  ${genre.uppercase()}", sortRows(rows), activeTab, onOpenSeries, onPlay) }
+                }
+            }
+            if (filtered.isNotEmpty()) item { EntryShelf("ALL ${activeTab.label}", sortRows(filtered), activeTab, onOpenSeries, onPlay) }
+            if (filtered.isEmpty()) item { Text(if (query.isNotBlank()) "No titles match your search." else "No ${activeTab.label.lowercase()} were returned by the provider.", color = Muted, fontSize = 13.sp) }
+            item {
+                Row(Modifier.fillMaxWidth().padding(end = 46.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("TMDB metadata  •  Streaming availability by JustWatch", color = Muted, fontSize = 10.sp)
+                    Spacer(Modifier.weight(1f))
+                    val linked = filtered.firstOrNull { !it.availabilityUrl.isNullOrBlank() } ?: entries.firstOrNull { !it.availabilityUrl.isNullOrBlank() }
+                    if (linked != null) ActionCard("AVAILABILITY INFO", onClick = { onAvailability(linked) }, width = 155.dp)
                 }
             }
         }
     }
 }
 
+private fun LazyListScope.addGroups(
+    title: String,
+    rows: List<CatalogEntry>,
+    keyOf: (CatalogEntry) -> String,
+    sortRows: (List<CatalogEntry>) -> List<CatalogEntry>,
+    onOpenSeries: (CatalogEntry) -> Unit,
+    onPlay: (CatalogEntry) -> Unit,
+    tab: ShelfTab,
+) {
+    rows.groupBy(keyOf).toSortedMap().forEach { (group, entries) ->
+        item { EntryShelf("$title  •  ${group.uppercase()}  •  ${entries.size}", sortRows(entries), tab, onOpenSeries, onPlay) }
+    }
+}
+
 @Composable
-private fun Featured(onPlay: (CatalogEntry) -> Unit, entry: CatalogEntry?) {
+private fun HeroPanel(tab: ShelfTab, count: Int) {
     Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(end = 52.dp)
-            .height(142.dp)
-            .background(Brush.horizontalGradient(listOf(Color(0xFF263C50), Color(0xFF142031), Color(0xFF101521))), RoundedCornerShape(18.dp))
-            .padding(horizontal = 28.dp, vertical = 20.dp),
-        verticalAlignment = Alignment.CenterVertically
+        Modifier.fillMaxWidth().padding(end = 46.dp).height(126.dp)
+            .background(Brush.horizontalGradient(listOf(Color(0xFF20364A), Color(0xFF172436), Panel)), RoundedCornerShape(18.dp))
+            .padding(horizontal = 25.dp, vertical = 17.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        Column(modifier = Modifier.weight(1f)) {
-            Text("YOUR LIBRARY, REIMAGINED", color = Mint, fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.4.sp)
-            Spacer(Modifier.height(8.dp))
-            Text("Find something worth watching.", color = Color.White, fontSize = 25.sp, fontWeight = FontWeight.Bold)
-            Text("One catalog. Sorted your way.", color = Muted, fontSize = 14.sp)
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+            Text("YOUR ENTERTAINMENT, ORGANIZED", color = Mint, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.4.sp)
+            Text(when (tab) { ShelfTab.LIVE -> "Go straight to Live TV."; ShelfTab.MOVIES -> "Find your next movie."; ShelfTab.SERIES -> "Pick up a new series." }, color = Color.White, fontSize = 23.sp, fontWeight = FontWeight.Bold)
+            Text("$count ${if (tab == ShelfTab.LIVE) "channels" else "titles"}  •  Grouped for the way you watch", color = Muted, fontSize = 12.sp)
         }
-        if (entry != null) ActionCard("▶  PLAY LIVE TV") { onPlay(entry) }
-        else Text("LIVE TV", color = Mint, fontSize = 13.sp, fontWeight = FontWeight.ExtraBold)
+        Text(when (tab) { ShelfTab.LIVE -> "◉  LIVE"; ShelfTab.MOVIES -> "▣  FILMS"; ShelfTab.SERIES -> "▤  SERIES" }, color = Mint, fontSize = 17.sp, fontWeight = FontWeight.ExtraBold)
     }
 }
 
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
-private fun ShelfEntries(title: String, entries: List<CatalogEntry>, onPlay: (CatalogEntry) -> Unit) {
-    Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
-        Text(title, color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
-        LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            items(entries.take(50), key = { "${it.kind}:${it.id}" }) { entry ->
-                Card(onClick = { onPlay(entry) }, modifier = Modifier.width(164.dp).height(236.dp),
-                    shape = CardDefaults.shape(RoundedCornerShape(12.dp)),
-                    colors = CardDefaults.colors(containerColor = Color(0xFF202A39), focusedContainerColor = Mint)) {
+private fun EntryShelf(title: String, entries: List<CatalogEntry>, tab: ShelfTab, onOpenSeries: (CatalogEntry) -> Unit, onPlay: (CatalogEntry) -> Unit) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Row(Modifier.fillMaxWidth().padding(end = 46.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(title, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+            Spacer(Modifier.width(8.dp))
+            Text("${entries.size}", color = Muted, fontSize = 10.sp)
+        }
+        LazyRow(horizontalArrangement = Arrangement.spacedBy(11.dp)) {
+            items(entries.take(36), key = { "${it.kind}:${it.id}:$title" }) { entry ->
+                Card(
+                    onClick = { if (tab == ShelfTab.SERIES) onOpenSeries(entry) else onPlay(entry) },
+                    modifier = Modifier.width(152.dp).height(194.dp),
+                    shape = CardDefaults.shape(RoundedCornerShape(11.dp)),
+                    colors = CardDefaults.colors(containerColor = PanelRaised, focusedContainerColor = Mint),
+                ) {
                     Box(Modifier.fillMaxSize()) {
-                        AsyncImage(model = entry.posterUrl, contentDescription = entry.title, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
-                        Column(Modifier.align(Alignment.BottomStart).fillMaxWidth().background(Brush.verticalGradient(listOf(Color.Transparent, Color(0xEE080B12)))).padding(horizontal = 12.dp, vertical = 11.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                            Text(entry.title.take(30), color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 2)
-                            val tags = listOfNotNull(entry.year?.toString(), entry.language, entry.tmdbGenres.takeIf { it.isNotEmpty() }?.take(2)?.joinToString(" · ")).joinToString(" · ")
-                            Text((if (tags.isBlank()) entry.category else tags).take(34), color = Muted, fontSize = 10.sp, maxLines = 1)
+                        if (!entry.posterUrl.isNullOrBlank()) AsyncImage(model = entry.posterUrl, contentDescription = entry.title, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+                        Column(
+                            Modifier.align(Alignment.BottomStart).fillMaxWidth()
+                                .background(Brush.verticalGradient(listOf(Color.Transparent, Color(0xF0080B12))))
+                                .padding(horizontal = 10.dp, vertical = 9.dp),
+                            verticalArrangement = Arrangement.spacedBy(3.dp),
+                        ) {
+                            Text(entry.title.take(34), color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, maxLines = 2)
+                            val tags = listOfNotNull(entry.year?.toString(), entry.language?.uppercase(), entry.tmdbGenres.firstOrNull()).joinToString("  •  ")
+                            Text((if (tags.isBlank()) entry.category else tags).take(34), color = Muted, fontSize = 9.sp, maxLines = 1)
                         }
                     }
                 }
@@ -399,19 +575,20 @@ private fun ShelfEntries(title: String, entries: List<CatalogEntry>, onPlay: (Ca
 
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
-private fun Shelf(title: String, entries: List<String>) {
+private fun EpisodeShelf(title: String, episodes: List<SeriesEpisode>, onPlay: (CatalogEntry) -> Unit) {
     Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
-        Text(title, color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
-        LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            items(entries) { entry ->
+        Text(title, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+        LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            items(episodes, key = { "episode:${it.id}" }) { episode ->
                 Card(
-                    onClick = {},
-                    modifier = Modifier.width(150.dp).height(62.dp).focusable(),
-                    shape = CardDefaults.shape(RoundedCornerShape(12.dp)),
-                    colors = CardDefaults.colors(containerColor = Color(0xFF202A39), focusedContainerColor = Mint)
+                    onClick = { onPlay(CatalogEntry(episode.id, episode.title, "${episode.season}", "S${episode.season}E${episode.episode}", CatalogKind.MOVIE, streamUrl = episode.streamUrl)) },
+                    modifier = Modifier.width(224.dp).height(72.dp),
+                    shape = CardDefaults.shape(RoundedCornerShape(10.dp)),
+                    colors = CardDefaults.colors(containerColor = PanelRaised, focusedContainerColor = Mint),
                 ) {
-                    Box(modifier = Modifier.fillMaxSize().padding(horizontal = 14.dp), contentAlignment = Alignment.CenterStart) {
-                        Text(entry, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                    Column(Modifier.fillMaxSize().padding(horizontal = 14.dp), verticalArrangement = Arrangement.Center) {
+                        Text("EPISODE ${episode.episode}", color = Mint, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                        Text(episode.title.take(32), color = Color.White, fontSize = 12.sp, maxLines = 1)
                     }
                 }
             }

@@ -32,9 +32,18 @@ data class CatalogEntry(
     val tmdbId: Int? = null,
     val tmdbGenres: List<String> = emptyList(),
     val overview: String? = null,
+    val tmdbProviders: List<String> = emptyList(),
+    val collection: String? = null,
+    val availabilityUrl: String? = null,
 )
 
-data class ProviderConfig(val baseUrl: String, val username: String, val password: String, val tmdbApiKey: String = "")
+data class ProviderConfig(
+    val baseUrl: String,
+    val username: String,
+    val password: String,
+    val tmdbApiKey: String = "",
+    val tmdbRegion: String = "IN",
+)
 
 data class CatalogSnapshot(val live: List<CatalogEntry>, val movies: List<CatalogEntry>, val series: List<CatalogEntry>)
 
@@ -143,7 +152,8 @@ class CredentialVault(context: Context) {
     private val alias = "stream-shelf-provider-v1"
 
     fun save(config: ProviderConfig) {
-        val plain = JSONObject().put("base", config.baseUrl).put("user", config.username).put("pass", config.password).put("tmdb", config.tmdbApiKey).toString()
+        val plain = JSONObject().put("base", config.baseUrl).put("user", config.username).put("pass", config.password)
+            .put("tmdb", config.tmdbApiKey).put("region", config.tmdbRegion).toString()
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, secretKey())
         val encrypted = cipher.doFinal(plain.toByteArray(Charsets.UTF_8))
@@ -158,7 +168,7 @@ class CredentialVault(context: Context) {
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.DECRYPT_MODE, secretKey(), GCMParameterSpec(128, Base64.decode(parts[0], Base64.NO_WRAP)))
         val json = JSONObject(String(cipher.doFinal(Base64.decode(parts[1], Base64.NO_WRAP)), Charsets.UTF_8))
-        ProviderConfig(json.getString("base"), json.getString("user"), json.getString("pass"), json.optString("tmdb"))
+        ProviderConfig(json.getString("base"), json.getString("user"), json.getString("pass"), json.optString("tmdb"), json.optString("region", "IN"))
     }.getOrNull()
 
     private fun secretKey(): SecretKey {
@@ -177,19 +187,24 @@ class CredentialVault(context: Context) {
 }
 
 /** A bounded search helper. Matching is conservative and leaves uncertain results unmatched. */
-class TmdbRepository(private val apiKey: String) {
-    suspend fun enrich(snapshot: CatalogSnapshot): CatalogSnapshot = withContext(Dispatchers.IO) {
+class TmdbRepository(
+    private val apiKey: String,
+    private val region: String = "IN",
+    private val metadataCache: TmdbMetadataCache? = null,
+) {
+    suspend fun enrich(snapshot: CatalogSnapshot, limitPerKind: Int = 60): CatalogSnapshot = withContext(Dispatchers.IO) {
         if (apiKey.isBlank()) return@withContext snapshot
         val movieGenres = fetchGenres("movie")
         val tvGenres = fetchGenres("tv")
-        suspend fun enrichRows(rows: List<CatalogEntry>, genres: Map<Int, String>): List<CatalogEntry> =
+        suspend fun enrichRows(rows: List<CatalogEntry>, type: String, genres: Map<Int, String>): List<CatalogEntry> =
             rows.mapIndexed { index, row ->
-                if (index >= 15 || row.tmdbGenres.isNotEmpty()) row else enrichEntry(row, genres)
+                if (index >= limitPerKind || row.tmdbId != null && row.tmdbGenres.isNotEmpty() && row.tmdbProviders.isNotEmpty()) row
+                else runCatching { enrichEntry(row, type, genres) }.getOrDefault(row)
             }
         CatalogSnapshot(
             live = snapshot.live,
-            movies = enrichRows(snapshot.movies, movieGenres),
-            series = enrichRows(snapshot.series, tvGenres),
+            movies = enrichRows(snapshot.movies, "movie", movieGenres),
+            series = enrichRows(snapshot.series, "tv", tvGenres),
         )
     }
 
@@ -204,28 +219,68 @@ class TmdbRepository(private val apiKey: String) {
         } finally { connection.disconnect() }
     }
 
-    private suspend fun enrichEntry(entry: CatalogEntry, genres: Map<Int, String>): CatalogEntry {
-        val match = bestMatch(entry) ?: return entry
-        val date = match.optString(if (entry.kind == CatalogKind.MOVIE) "release_date" else "first_air_date")
+    private suspend fun enrichEntry(entry: CatalogEntry, type: String, genres: Map<Int, String>): CatalogEntry {
+        metadataCache?.get(entry.kind, entry.id, region)?.let { return entry.applyMetadata(it) }
+        val match = bestMatch(entry, type) ?: return entry
+        val tmdbId = match.optInt("id").takeIf { it > 0 } ?: return entry
+        val objectPath = if (type == "movie") "/movie/$tmdbId" else "/tv/$tmdbId"
+        val details = runCatching { tmdbObject(objectPath) }.getOrDefault(JSONObject())
+        val watchData = runCatching { tmdbObject("$objectPath/watch/providers") }.getOrDefault(JSONObject())
+        val regionalProviders = watchData.optJSONObject("results")?.optJSONObject(region.uppercase())
+        val providers = listOf("flatrate", "free", "ads", "rent", "buy")
+            .flatMap { regionalProviders?.optJSONArray(it).objectRows().orEmpty() }
+            .map { it.optString("provider_name") }.filter { it.isNotBlank() }.distinct().sorted()
+        val date = match.optString(if (type == "movie") "release_date" else "first_air_date")
         val genreIds = match.optJSONArray("genre_ids") ?: JSONArray()
         val names = (0 until genreIds.length()).mapNotNull { genres[genreIds.optInt(it)] }
         val poster = match.optString("poster_path").takeIf { it.startsWith("/") }?.let { "https://image.tmdb.org/t/p/w500$it" }
-        return entry.copy(
-            posterUrl = poster ?: entry.posterUrl,
-            year = date.take(4).toIntOrNull() ?: entry.year,
-            language = match.optString("original_language").takeIf { it.isNotBlank() } ?: entry.language,
-            tmdbId = match.optInt("id").takeIf { it > 0 } ?: entry.tmdbId,
+        val metadata = CatalogMetadata(
+            tmdbId = tmdbId,
+            posterUrl = poster,
+            year = date.take(4).toIntOrNull(),
+            language = match.optString("original_language").takeIf { it.isNotBlank() },
             tmdbGenres = names,
             overview = match.optString("overview").takeIf { it.isNotBlank() },
+            tmdbProviders = providers,
+            collection = details.optJSONObject("belongs_to_collection")?.optString("name")?.takeIf { !it.isNullOrBlank() },
+            availabilityUrl = regionalProviders?.optString("link")?.takeIf { it.startsWith("https://") },
         )
+        metadataCache?.put(entry.kind, entry.id, region, metadata)
+        return entry.applyMetadata(metadata)
     }
 
-    suspend fun bestMatch(entry: CatalogEntry): JSONObject? = withContext(Dispatchers.IO) {
+    private fun CatalogEntry.applyMetadata(metadata: CatalogMetadata) = copy(
+            posterUrl = metadata.posterUrl ?: posterUrl,
+            year = metadata.year ?: year,
+            language = metadata.language ?: language,
+            tmdbId = metadata.tmdbId,
+            tmdbGenres = metadata.tmdbGenres,
+            overview = metadata.overview ?: overview,
+            tmdbProviders = metadata.tmdbProviders,
+            collection = metadata.collection,
+            availabilityUrl = metadata.availabilityUrl,
+        )
+
+    private fun tmdbObject(path: String): JSONObject {
+        val connection = URL("https://api.themoviedb.org/3$path?api_key=${Uri.encode(apiKey)}&region=${Uri.encode(region.uppercase())}").openConnection() as HttpURLConnection
+        connection.connectTimeout = 12_000
+        connection.readTimeout = 18_000
+        connection.setRequestProperty("Accept", "application/json")
+        return try {
+            if (connection.responseCode !in 200..299) throw IllegalStateException("TMDB request failed (${connection.responseCode})")
+            connection.inputStream.bufferedReader().use { JSONObject(it.readText()) }
+        } finally { connection.disconnect() }
+    }
+
+    private fun JSONArray?.objectRows(): List<JSONObject> = this?.let { array -> (0 until array.length()).mapNotNull { array.optJSONObject(it) } }.orEmpty()
+
+    suspend fun bestMatch(entry: CatalogEntry, requestedType: String? = null): JSONObject? = withContext(Dispatchers.IO) {
         if (apiKey.isBlank() || entry.kind == CatalogKind.LIVE) return@withContext null
-        val type = if (entry.kind == CatalogKind.MOVIE) "movie" else "tv"
+        val type = requestedType ?: if (entry.kind == CatalogKind.MOVIE) "movie" else "tv"
         val query = Uri.encode(entry.title)
         val year = entry.year?.let { if (type == "movie") "&year=$it" else "&first_air_date_year=$it" }.orEmpty()
-        val connection = URL("https://api.themoviedb.org/3/search/$type?api_key=${Uri.encode(apiKey)}&query=$query$year&include_adult=false").openConnection() as HttpURLConnection
+        val endpoint = if (type == "movie") "search/movie" else "search/tv"
+        val connection = URL("https://api.themoviedb.org/3/$endpoint?api_key=${Uri.encode(apiKey)}&query=$query$year&include_adult=false&region=${Uri.encode(region.uppercase())}").openConnection() as HttpURLConnection
         connection.connectTimeout = 12_000
         connection.readTimeout = 18_000
         connection.setRequestProperty("Accept", "application/json")
@@ -239,7 +294,14 @@ class TmdbRepository(private val apiKey: String) {
         } finally { connection.disconnect() }
     }
 
-    private fun normalize(value: String) = value.lowercase().replace(Regex("[^\\p{L}\\p{N}]+"), " ").trim()
+    private fun normalize(value: String): String {
+        val cleaned = value
+            .replace(Regex("[\\[(](19|20)\\d{2}[\\])]"), " ")
+            .replace(Regex("\\b(19|20)\\d{2}\\b\\s*$"), " ")
+            .replace(Regex("\\b(2160p|1080p|720p|4k|uhd|fhd|hevc|h\\.?265|h\\.?264|x265|x264|web[- ]?dl|webrip|bluray|brrip|hdr10?|10bit|dubbed|subbed|multi[- ]?audio)\\b", RegexOption.IGNORE_CASE), " ")
+            .replace(Regex("\\bS\\d{1,2}(?:E\\d{1,3})?\\b", RegexOption.IGNORE_CASE), " ")
+        return cleaned.lowercase().replace(Regex("[^\\p{L}\\p{N}]+"), " ").trim()
+    }
     private fun similarity(a: String, b: String): Double {
         if (a == b) return 1.0
         if (a.isBlank() || b.isBlank()) return 0.0
@@ -248,5 +310,38 @@ class TmdbRepository(private val apiKey: String) {
         val overlap = aa.intersect(bb).size.toDouble()
         return (2 * overlap / (aa.size + bb.size)) * (if (a.contains(b) || b.contains(a)) 1.0 else 0.9)
     }
+}
+
+data class CatalogMetadata(
+    val tmdbId: Int,
+    val posterUrl: String?,
+    val year: Int?,
+    val language: String?,
+    val tmdbGenres: List<String>,
+    val overview: String?,
+    val tmdbProviders: List<String>,
+    val collection: String?,
+    val availabilityUrl: String?,
+)
+
+/** Small on-device cache avoids repeating metadata lookups every time the app opens. */
+class TmdbMetadataCache(context: Context) {
+    private val prefs = context.getSharedPreferences("tmdb_metadata_cache", Context.MODE_PRIVATE)
+    fun get(kind: CatalogKind, id: String, region: String): CatalogMetadata? = runCatching {
+        val json = prefs.getString(key(kind, id, region), null)?.let(::JSONObject) ?: return null
+        if (System.currentTimeMillis() - json.optLong("saved") > 30L * 24 * 60 * 60 * 1000) return null
+        CatalogMetadata(json.getInt("id"), json.optString("poster").ifBlank { null }, json.optInt("year").takeIf { it > 0 },
+            json.optString("language").ifBlank { null }, json.getJSONArray("genres").strings(), json.optString("overview").ifBlank { null },
+            json.getJSONArray("providers").strings(), json.optString("collection").ifBlank { null }, json.optString("availabilityUrl").ifBlank { null })
+    }.getOrNull()
+    fun put(kind: CatalogKind, id: String, region: String, metadata: CatalogMetadata) {
+        val json = JSONObject().put("saved", System.currentTimeMillis()).put("id", metadata.tmdbId)
+            .put("poster", metadata.posterUrl).put("year", metadata.year ?: 0).put("language", metadata.language)
+            .put("genres", JSONArray(metadata.tmdbGenres)).put("overview", metadata.overview)
+            .put("providers", JSONArray(metadata.tmdbProviders)).put("collection", metadata.collection).put("availabilityUrl", metadata.availabilityUrl)
+        prefs.edit().putString(key(kind, id, region), json.toString()).apply()
+    }
+    private fun key(kind: CatalogKind, id: String, region: String) = "${region.uppercase()}:${kind.name}:$id"
+    private fun JSONArray.strings() = (0 until length()).mapNotNull { optString(it).takeIf(String::isNotBlank) }
 }
 
